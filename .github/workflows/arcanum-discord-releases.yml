@@ -1,0 +1,119 @@
+name: Arcanum - Annonces Discord des releases
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  annoncer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Envoyer les informations de la release sur Discord
+        env:
+          ARCANUM_DISCORD_WEBHOOK_URL: ${{ secrets.ARCANUM_DISCORD_WEBHOOK_URL }}
+          ARCANUM_GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import time
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError, URLError
+
+          webhook = os.environ.get("ARCANUM_DISCORD_WEBHOOK_URL", "").strip()
+          if not webhook.startswith((
+              "https://discord.com/api/webhooks/",
+              "https://discordapp.com/api/webhooks/",
+          )):
+              raise SystemExit("Secret ARCANUM_DISCORD_WEBHOOK_URL absent ou invalide dans arcanum-releases")
+
+          def envoyer(message):
+              payload = json.dumps({
+                  "username": "Arcanum • Mises à jour",
+                  "content": message,
+                  "allowed_mentions": {"parse": []},
+              }, ensure_ascii=False).encode("utf-8")
+              for tentative in range(5):
+                  req = Request(
+                      webhook,
+                      data=payload,
+                      headers={
+                          "Content-Type": "application/json",
+                          "User-Agent": "ArcanumReleaseNotifier/1.0",
+                      },
+                      method="POST",
+                  )
+                  try:
+                      with urlopen(req, timeout=20) as response:
+                          if response.status not in (200, 204):
+                              raise RuntimeError(f"Discord : HTTP {response.status}")
+                      return
+                  except HTTPError as exc:
+                      if exc.code == 429 and tentative < 4:
+                          try:
+                              seconds = json.loads(exc.read().decode("utf-8")).get("retry_after", 2)
+                              time.sleep(min(max(float(seconds), 1.0), 30.0))
+                          except (ValueError, KeyError, TypeError):
+                              time.sleep(2)
+                      elif exc.code >= 500 and tentative < 4:
+                          time.sleep(2 * (tentative + 1))
+                      else:
+                          raise SystemExit(f"Discord refuse le message (HTTP {exc.code})")
+                  except URLError:
+                      if tentative == 4:
+                          raise
+                      time.sleep(2 * (tentative + 1))
+
+          if os.environ.get("ARCANUM_GITHUB_EVENT_NAME") == "workflow_dispatch":
+              envoyer("✅ **Arcanum — test réussi !** Les annonces GitHub Releases arrivent bien sur Discord.")
+              print("Message de test envoyé ; aucune release créée.")
+              raise SystemExit(0)
+
+          event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+          release = event.get("release") or {}
+          version = str(release.get("tag_name") or "Version inconnue")
+          titre = str(release.get("name") or "Nouvelle version")
+          notes = str(release.get("body") or "_Aucune note de mise à jour fournie._").strip()
+          page = str(release.get("html_url") or "")
+          assets = release.get("assets") or []
+          archive = next((a for a in assets if str(a.get("name", "")).lower().endswith(".zip")), None)
+          telechargement = str(archive.get("browser_download_url") or "") if archive else page
+
+          message = (
+              f"## 🃏 Arcanum — {version}\n"
+              f"**{titre}**\n\n"
+              f"**📜 Notes de mise à jour**\n{notes}\n\n"
+              f"**🔗 Release GitHub :** {page}\n"
+              f"**📦 Télécharger :** {telechargement}"
+          )
+
+          def decouper(texte, limite=1750):
+              morceaux, courant = [], ""
+              for ligne in texte.splitlines(keepends=True):
+                  while ligne:
+                      place = limite - len(courant)
+                      if len(ligne) <= place:
+                          courant += ligne
+                          break
+                      if place:
+                          courant += ligne[:place]
+                          ligne = ligne[place:]
+                      morceaux.append(courant)
+                      courant = ""
+              if courant:
+                  morceaux.append(courant)
+              return morceaux
+
+          parties = decouper(message)
+          for index, partie in enumerate(parties, 1):
+              if index > 1:
+                  partie = f"**📜 Suite du changelog ({index}/{len(parties)})**\n" + partie
+              envoyer(partie)
+              print(f"Message Discord {index}/{len(parties)} envoyé pour {version}")
+              if index < len(parties):
+                  time.sleep(1)
+          PY
